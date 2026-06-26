@@ -11,6 +11,8 @@ CERT_CRT="/etc/hysteria/certs/server.crt"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 CLIENT_FILE="/root/hysteria2-client.txt"
 PORT="${PORT:-443}"
+MASQUERADE_URL="${MASQUERADE_URL:-https://www.bing.com}"
+MASQUERADE_HOST="${MASQUERADE_HOST:-www.bing.com}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,7 +54,7 @@ check_ubuntu() {
 install_dependencies() {
   log "安装基础依赖..."
   apt-get update -y
-  apt-get install -y curl wget openssl ca-certificates jq iproute2
+  apt-get install -y curl wget openssl ca-certificates jq iproute2 dnsutils
 }
 
 install_hysteria2() {
@@ -82,7 +84,57 @@ get_public_ip() {
     exit 1
   fi
 
-  printf '%s\n' "$ip"
+  printf '%s
+' "$ip"
+}
+
+check_masquerade_dns() {
+  local system_dns cloudflare_dns google_dns unique_count
+
+  system_dns="$(dig +short A "$MASQUERADE_HOST" | head -n1 | tr -d '\r')"
+  cloudflare_dns="$(dig +short A "$MASQUERADE_HOST" @1.1.1.1 | head -n1 | tr -d '\r')"
+  google_dns="$(dig +short A "$MASQUERADE_HOST" @8.8.8.8 | head -n1 | tr -d '\r')"
+
+  log "伪装站点 DNS 检查：${MASQUERADE_HOST}"
+  log "系统 DNS 解析结果：${system_dns:-<空>}"
+  log "1.1.1.1 解析结果：${cloudflare_dns:-<空>}"
+  log "8.8.8.8 解析结果：${google_dns:-<空>}"
+
+  if [[ -z "$system_dns" || -z "$cloudflare_dns" || -z "$google_dns" ]]; then
+    warn "伪装站点 DNS 有解析结果为空，证书申请或伪装访问可能受影响。"
+  fi
+
+  if [[ -n "$system_dns" && -n "$cloudflare_dns" && -n "$google_dns" ]]; then
+    unique_count="$(printf '%s
+' "$system_dns" "$cloudflare_dns" "$google_dns" | awk 'NF' | sort -u | wc -l | tr -d ' ')"
+    if [[ "$unique_count" -gt 1 ]]; then
+      warn "不同解析器返回了不同的 A 记录。伪装站点和证书签发可能出现不稳定。"
+    fi
+  fi
+}
+
+check_bbr() {
+  local congestion_control qdisc
+  congestion_control="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+  log "当前 TCP 拥塞控制：${congestion_control:-<无法读取>}"
+  log "当前默认队列规则：${qdisc:-<无法读取>}"
+
+  if [[ "$congestion_control" != "bbr" ]]; then
+    warn "当前 TCP 拥塞控制不是 bbr，吞吐和延迟表现可能不理想。"
+  fi
+}
+
+print_mtu_hint() {
+  local mtu
+  mtu="$(ip route get 1.1.1.1 2>/dev/null | awk 'match($0, /mtu ([0-9]+)/, m) {print m[1]; exit}')"
+
+  if [[ -n "$mtu" ]]; then
+    log "路径 MTU 参考值：${mtu}"
+  else
+    warn "未能从 ip route get 1.1.1.1 获取 MTU。若出现丢包或连接慢，请手动检查路径 MTU、隧道或运营商限制。"
+  fi
 }
 
 url_encode() {
@@ -150,7 +202,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com
+    url: ${MASQUERADE_URL}
     rewriteHost: true
 EOF
 
@@ -217,6 +269,7 @@ verify_listening() {
   fi
 }
 
+# shellcheck disable=SC2059
 write_client_file() {
   local password="$1"
   local public_ip="$2"
@@ -245,6 +298,14 @@ server: ${public_ip}:${PORT}
 auth: ${password}
 tls:
   insecure: true
+
+============================================================
+网络排查建议
+============================================================
+UDP 端口: ${PORT}/udp
+如果无法连接，请检查云防火墙 / 安全组、VPS 提供商 UDP 过滤、
+本地客户端网络、MTU，以及客户端 insecure=true。
+伪装 URL: ${MASQUERADE_URL}
 EOF
 
   chmod 600 "$CLIENT_FILE"
@@ -273,6 +334,7 @@ EOF
   printf "${BOLD}${GREEN}客户端配置已保存到：%s${NC}\n" "$CLIENT_FILE"
 }
 
+# shellcheck disable=SC2059
 print_management_commands() {
   printf "\n"
   printf "${BOLD}${GREEN}============================================================${NC}\n"
@@ -284,6 +346,7 @@ print_management_commands() {
   printf "${YELLOW}查看客户端配置：${NC}cat ${CLIENT_FILE}\n"
 }
 
+# shellcheck disable=SC2059
 print_subscription_link() {
   local hy2_uri="$1"
 
@@ -304,6 +367,9 @@ main() {
   require_root
   check_ubuntu
   install_dependencies
+  check_masquerade_dns
+  check_bbr
+  print_mtu_hint
   install_hysteria2
 
   password="$(generate_password)"
