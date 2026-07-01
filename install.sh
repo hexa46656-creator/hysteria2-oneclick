@@ -10,6 +10,7 @@ CERT_KEY="/etc/hysteria/certs/server.key"
 CERT_CRT="/etc/hysteria/certs/server.crt"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 CLIENT_FILE="/root/hysteria2-client.txt"
+NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-hysteria2-oneclick-tuning.conf"
 PORT="${PORT:-443}"
 MASQUERADE_URL="${MASQUERADE_URL:-https://speed.cloudflare.com}"
 MASQUERADE_HOST="${MASQUERADE_HOST:-speed.cloudflare.com}"
@@ -144,6 +145,53 @@ check_ubuntu() {
 
 install_dependencies() {
   installer_core_install_packages curl wget openssl ca-certificates jq iproute2 dnsutils qrencode
+}
+
+detect_path_mtu() {
+  local mtu
+
+  mtu="$(ip route get 1.1.1.1 2>/dev/null | awk 'match($0, /mtu ([0-9]+)/, m) {print m[1]; exit}')"
+
+  if [[ -n "${mtu}" ]]; then
+    log "路径 MTU 参考值：${mtu}"
+    if [[ "${mtu}" -lt 1350 || "${mtu}" -gt 1450 ]]; then
+      warn "路径 MTU 参考值不在 1350-1450 范围内，Hysteria2 的自适应 MTU 探测可能需要更多时间收敛：${mtu}"
+    fi
+  else
+    warn "未能从 ip route get 1.1.1.1 获取 MTU。若出现丢包或连接慢，请手动检查路径 MTU、隧道或运营商限制。"
+  fi
+}
+
+enable_network_tuning() {
+  log "应用 Hysteria2 UDP/TCP 网络调优..."
+
+  cat > "${NETWORK_SYSCTL_FILE}" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+net.core.netdev_max_backlog=5000
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+EOF
+
+  sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || warn "Failed to apply net.core.default_qdisc=fq immediately."
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || warn "Failed to apply net.ipv4.tcp_congestion_control=bbr immediately."
+  sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || warn "Failed to apply net.ipv4.tcp_fastopen=3 immediately."
+  sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || warn "Failed to apply net.ipv4.tcp_mtu_probing=1 immediately."
+  sysctl -w net.core.rmem_max=67108864 >/dev/null 2>&1 || warn "Failed to apply net.core.rmem_max immediately."
+  sysctl -w net.core.wmem_max=67108864 >/dev/null 2>&1 || warn "Failed to apply net.core.wmem_max immediately."
+  sysctl -w net.core.rmem_default=8388608 >/dev/null 2>&1 || warn "Failed to apply net.core.rmem_default immediately."
+  sysctl -w net.core.wmem_default=8388608 >/dev/null 2>&1 || warn "Failed to apply net.core.wmem_default immediately."
+  sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1 || warn "Failed to apply net.core.netdev_max_backlog immediately."
+  sysctl -w net.ipv4.udp_rmem_min=16384 >/dev/null 2>&1 || warn "Failed to apply net.ipv4.udp_rmem_min immediately."
+  sysctl -w net.ipv4.udp_wmem_min=16384 >/dev/null 2>&1 || warn "Failed to apply net.ipv4.udp_wmem_min immediately."
+
+  detect_path_mtu
 }
 
 print_client_qr() {
@@ -341,6 +389,14 @@ auth:
   type: password
   password: ${password}
 
+quic:
+  disablePathMTUDiscovery: false
+
+congestion:
+  type: bbr
+
+ignoreClientBandwidth: true
+
 masquerade:
   type: proxy
   proxy:
@@ -528,6 +584,7 @@ main() {
   require_root
   check_ubuntu
   install_dependencies
+  enable_network_tuning
   check_masquerade_dns
   check_bbr
   print_mtu_hint
