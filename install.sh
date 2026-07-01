@@ -11,8 +11,9 @@ CERT_CRT="/etc/hysteria/certs/server.crt"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
 CLIENT_FILE="/root/hysteria2-client.txt"
 PORT="${PORT:-443}"
-MASQUERADE_URL="${MASQUERADE_URL:-https://www.bing.com}"
-MASQUERADE_HOST="${MASQUERADE_HOST:-www.bing.com}"
+MASQUERADE_URL="${MASQUERADE_URL:-https://speed.cloudflare.com}"
+MASQUERADE_HOST="${MASQUERADE_HOST:-speed.cloudflare.com}"
+INSTALLER_CORE_DIR="${INSTALLER_CORE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../vps-installer-core" 2>/dev/null && pwd || true)}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,6 +26,14 @@ log() { printf "${GREEN}[INFO]${NC} %s\n" "$*"; }
 warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 
+if [[ -z "${INSTALLER_CORE_DIR}" || ! -f "${INSTALLER_CORE_DIR}/installer_core.sh" ]]; then
+  err "Missing shared installer core. Expected vps-installer-core/installer_core.sh next to this repository or set INSTALLER_CORE_DIR."
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "${INSTALLER_CORE_DIR}/installer_core.sh"
+
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     err "请使用 root 执行：bash install.sh"
@@ -34,27 +43,65 @@ require_root() {
 }
 
 check_ubuntu() {
-  if [[ ! -f /etc/os-release ]]; then
-    err "无法识别系统：缺少 /etc/os-release"
-    exit 1
-  fi
-
-  # shellcheck disable=SC1091
-  . /etc/os-release
-
-  if [[ "${ID:-}" != "ubuntu" ]]; then
-    err "当前系统不是 Ubuntu：${PRETTY_NAME:-unknown}"
-    err "本脚本仅支持 Ubuntu LTS。"
-    exit 1
-  fi
-
-  log "检测到系统：${PRETTY_NAME:-Ubuntu}"
+  installer_core_detect_os
+  log "检测到系统：${INSTALLER_OS_PRETTY_NAME}"
 }
 
 install_dependencies() {
-  log "安装基础依赖..."
-  apt-get update -y
-  apt-get install -y curl wget openssl ca-certificates jq iproute2 dnsutils
+  installer_core_install_packages curl wget openssl ca-certificates jq iproute2 dnsutils qrencode
+}
+
+print_client_qr() {
+  local client_url="${1:-}"
+  local output_file="${2:-}"
+
+  if [[ -z "${client_url}" ]]; then
+    echo "[WARN] Client URL is empty, skip QR code generation."
+    return 0
+  fi
+
+  if [[ -z "${output_file}" ]]; then
+    output_file="/root/hysteria2-qr.png"
+  fi
+
+  if ! command -v qrencode >/dev/null 2>&1; then
+    echo "[INFO] Installing qrencode..."
+    if command -v apt >/dev/null 2>&1; then
+      apt update >/dev/null 2>&1 || true
+      apt install -y qrencode >/dev/null 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y qrencode >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if ! command -v qrencode >/dev/null 2>&1; then
+    echo "[WARN] qrencode is not available, skip QR code generation."
+    echo "[INFO] Client URL:"
+    echo "${client_url}"
+    return 0
+  fi
+
+  echo
+  echo "========== Client QR Code =========="
+  if ! qrencode -t ANSIUTF8 "${client_url}"; then
+    echo "[WARN] Failed to render QR code in terminal."
+  fi
+
+  if qrencode -o "${output_file}" "${client_url}"; then
+    chmod 600 "${output_file}"
+    echo
+    echo "[OK] QR code saved to: ${output_file}"
+  else
+    echo "[WARN] Failed to save QR code PNG."
+  fi
+
+  echo
+  echo "Mobile import:"
+  echo "1. Open Shadowrocket / v2rayNG / Hiddify / NekoBox"
+  echo "2. Tap scan QR code"
+  echo "3. Scan the QR code above"
+  echo "4. Save and test the node"
 }
 
 install_hysteria2() {
@@ -332,6 +379,20 @@ EOF
   printf "${CYAN}  insecure: true${NC}\n"
   printf "\n"
   printf "${BOLD}${GREEN}客户端配置已保存到：%s${NC}\n" "$CLIENT_FILE"
+
+  local subscription_uuid
+  subscription_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
+  export SUBSCRIPTION_PROTOCOL="hysteria2"
+  export SUBSCRIPTION_UUID="${subscription_uuid}"
+  export SUBSCRIPTION_DIR="/sub/${subscription_uuid}"
+  export SUBSCRIPTION_SERVER="${public_ip}"
+  export SUBSCRIPTION_PASSWORD="${password}"
+  export SUBSCRIPTION_CLIENT_NAME="Hysteria2"
+  export SUBSCRIPTION_PORT="${PORT}"
+  export SUBSCRIPTION_SNI="${MASQUERADE_HOST}"
+  installer_core_subscription_protocol_defaults
+  installer_core_publish_subscription
+  installer_core_print_completion_block "$(installer_core_mode_label)" "${SUBSCRIPTION_ACCESS_URL}" "Shadowrocket, v2rayNG, Clash, sing-box"
 }
 
 # shellcheck disable=SC2059
@@ -357,6 +418,8 @@ print_subscription_link() {
   printf "${BOLD}${YELLOW}%s${NC}\n" "$hy2_uri"
   printf "${BOLD}${GREEN}========================================${NC}\n"
   printf "\n"
+
+  print_client_qr "${SUBSCRIPTION_ACCESS_URL:-${hy2_uri:-}}" "/root/hysteria2-qr.png"
 }
 
 main() {
